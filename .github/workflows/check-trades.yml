@@ -25,4 +25,6 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: node check-trades.js
+        run: |
+          cd $GITHUB_WORKSPACE
+          node check-trades.js
