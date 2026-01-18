@@ -10,104 +10,135 @@ const CONFIG = {
   SUPABASE_KEY: process.env.SUPABASE_KEY
 };
 
-// Scrape House Stock Watcher (they aggregate congressional trades)
+// Fetch congressional trades from Senate Stock Watcher
 async function fetchRecentTrades() {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'house-stock-watcher-data.s3-us-west-2.amazonaws.com',
-      path: '/data/all_transactions.json',
+      hostname: 'senate-stock-watcher-data.s3-us-west-2.amazonaws.com',
+      path: '/aggregate/all_transactions.json',
       method: 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0'
       }
     };
 
+    console.log('Fetching from Senate Stock Watcher...');
+
     https.get(options, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          // Get only the most recent 20 trades
-          const recent = parsed.slice(0, 20);
+          // Get only the most recent 15 trades
+          const recent = Array.isArray(parsed) ? parsed.slice(0, 15) : [];
+          console.log(`Successfully parsed ${recent.length} trades`);
           resolve(recent);
         } catch (e) {
+          console.error('JSON parse error:', e.message);
+          console.error('Data preview:', data.substring(0, 200));
           reject(e);
         }
       });
-    }).on('error', reject);
+    }).on('error', (err) => {
+      console.error('HTTPS request error:', err.message);
+      reject(err);
+    });
   });
 }
 
 // Check if we've seen this trade before in Supabase
 async function isNewTrade(tradeId) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`${CONFIG.SUPABASE_URL}/rest/v1/seen_trades`);
-    url.searchParams.append('id', `eq.${tradeId}`);
-    
-    const options = {
-      method: 'GET',
-      headers: {
-        'apikey': CONFIG.SUPABASE_KEY,
-        'Authorization': `Bearer ${CONFIG.SUPABASE_KEY}`
-      }
-    };
+  if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_KEY) {
+    console.log('Supabase not configured, treating all as new');
+    return true;
+  }
 
-    const req = https.request(url, options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try {
-          const results = JSON.parse(data);
-          resolve(results.length === 0);
-        } catch (e) {
-          // If table doesn't exist yet, treat as new
-          resolve(true);
+  return new Promise((resolve) => {
+    try {
+      const url = new URL(`${CONFIG.SUPABASE_URL}/rest/v1/seen_trades`);
+      url.searchParams.append('id', `eq.${tradeId}`);
+      
+      const options = {
+        method: 'GET',
+        headers: {
+          'apikey': CONFIG.SUPABASE_KEY,
+          'Authorization': `Bearer ${CONFIG.SUPABASE_KEY}`
         }
+      };
+
+      const req = https.request(url, options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          try {
+            const results = JSON.parse(data);
+            resolve(results.length === 0);
+          } catch (e) {
+            resolve(true);
+          }
+        });
       });
-    });
-    
-    req.on('error', () => resolve(true)); // If error, treat as new
-    req.end();
+      
+      req.on('error', () => resolve(true));
+      req.end();
+    } catch (e) {
+      resolve(true);
+    }
   });
 }
 
 // Mark trade as seen in Supabase
 async function markAsSeen(trade) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`${CONFIG.SUPABASE_URL}/rest/v1/seen_trades`);
-    
-    const postData = JSON.stringify({
-      id: trade.disclosure_date + '-' + trade.representative + '-' + trade.ticker,
-      politician: trade.representative,
-      ticker: trade.ticker,
-      filed_date: trade.disclosure_date
-    });
+  if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_KEY) {
+    return Promise.resolve();
+  }
 
-    const options = {
-      method: 'POST',
-      headers: {
-        'apikey': CONFIG.SUPABASE_KEY,
-        'Authorization': `Bearer ${CONFIG.SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=minimal'
-      }
-    };
+  return new Promise((resolve) => {
+    try {
+      const url = new URL(`${CONFIG.SUPABASE_URL}/rest/v1/seen_trades`);
+      
+      const postData = JSON.stringify({
+        id: trade.transaction_date + '-' + trade.senator + '-' + trade.ticker,
+        politician: trade.senator,
+        ticker: trade.ticker,
+        filed_date: trade.transaction_date
+      });
 
-    const req = https.request(url, options, (res) => {
+      const options = {
+        method: 'POST',
+        headers: {
+          'apikey': CONFIG.SUPABASE_KEY,
+          'Authorization': `Bearer ${CONFIG.SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        }
+      };
+
+      const req = https.request(url, options, () => resolve());
+      req.on('error', () => resolve());
+      req.write(postData);
+      req.end();
+    } catch (e) {
       resolve();
-    });
-    
-    req.on('error', () => resolve()); // Continue even if fails
-    req.write(postData);
-    req.end();
+    }
   });
 }
 
 // Send email alert via Resend
 async function sendEmailAlert(trades) {
-  const tradesList = trades.map(t => 
-    `• ${t.representative}: ${t.type} ${t.ticker} (${t.amount}) - Filed: ${t.disclosure_date}`
+  if (!CONFIG.RESEND_API_KEY || !CONFIG.YOUR_EMAIL) {
+    console.log('Email not configured, skipping email');
+    return Promise.resolve();
+  }
+
+  const tradesList = trades.slice(0, 10).map(t => 
+    `• ${t.senator || t.representative}: ${t.type} ${t.ticker} ($${t.amount || 'Unknown'}) - ${t.transaction_date}`
   ).join('\n');
 
   const emailBody = `
@@ -115,7 +146,9 @@ async function sendEmailAlert(trades) {
 
 ${tradesList}
 
-View all trades at: https://housestockwatcher.com/
+${trades.length > 10 ? `\n... and ${trades.length - 10} more trades\n` : ''}
+
+View all trades at: https://senatestockwatcher.com/
 
 ---
 This is an automated alert from your Congressional Trade Tracker.
@@ -136,7 +169,7 @@ This is an automated alert from your Congressional Trade Tracker.
       headers: {
         'Authorization': `Bearer ${CONFIG.RESEND_API_KEY}`,
         'Content-Type': 'application/json',
-        'Content-Length': postData.length
+        'Content-Length': Buffer.byteLength(postData)
       }
     };
 
@@ -148,7 +181,8 @@ This is an automated alert from your Congressional Trade Tracker.
           console.log('✓ Email sent successfully');
           resolve(data);
         } else {
-          reject(new Error(`Email failed: ${res.statusCode} - ${data}`));
+          console.error(`Email failed: ${res.statusCode} - ${data}`);
+          reject(new Error(`Email failed: ${res.statusCode}`));
         }
       });
     });
@@ -161,27 +195,44 @@ This is an automated alert from your Congressional Trade Tracker.
 
 // Main function
 async function checkForNewTrades() {
-  console.log('🔍 Checking for new trades...');
+  console.log('🔍 Starting Congressional Trade Checker...');
+  console.log('Email configured:', !!CONFIG.YOUR_EMAIL);
+  console.log('Resend configured:', !!CONFIG.RESEND_API_KEY);
+  console.log('Supabase configured:', !!CONFIG.SUPABASE_URL);
   
   try {
     const trades = await fetchRecentTrades();
     
-    console.log(`Found ${trades.length} recent trades`);
+    if (!trades || trades.length === 0) {
+      console.log('❌ No trades found');
+      return;
+    }
+
+    console.log(`✓ Found ${trades.length} recent trades`);
     
     const newTrades = [];
     for (const trade of trades) {
-      const tradeId = trade.disclosure_date + '-' + trade.representative + '-' + trade.ticker;
+      if (!trade.senator && !trade.representative) continue;
+      if (!trade.ticker) continue;
+      
+      const tradeId = (trade.transaction_date || trade.disclosure_date) + '-' + 
+                     (trade.senator || trade.representative) + '-' + trade.ticker;
+      
       if (await isNewTrade(tradeId)) {
         newTrades.push(trade);
       }
     }
     
     if (newTrades.length === 0) {
-      console.log('✓ No new trades');
+      console.log('✓ No new trades (all previously seen)');
       return;
     }
     
     console.log(`🎯 Found ${newTrades.length} NEW trades!`);
+    
+    // Show sample
+    console.log('Sample:', newTrades[0].senator || newTrades[0].representative, 
+                newTrades[0].type, newTrades[0].ticker);
     
     await sendEmailAlert(newTrades);
     
@@ -193,6 +244,7 @@ async function checkForNewTrades() {
     
   } catch (error) {
     console.error('❌ Error:', error.message);
+    console.error('Stack:', error.stack);
     throw error;
   }
 }
