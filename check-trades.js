@@ -10,23 +10,42 @@ const CONFIG = {
   SUPABASE_KEY: process.env.SUPABASE_KEY
 };
 
-// Fetch congressional trades from Senate Stock Watcher
+// Fetch from unusual whales congressional trading tracker (free, public)
 async function fetchRecentTrades() {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'senate-stock-watcher-data.s3-us-west-2.amazonaws.com',
-      path: '/aggregate/all_transactions.json',
+      hostname: 'www.quiverquant.com',
+      path: '/congresstrading/',
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     };
 
-    console.log('Fetching from Senate Stock Watcher...');
+    console.log('Fetching congressional trades...');
 
     https.get(options, (res) => {
       if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
+        console.log(`HTTP ${res.statusCode}, trying alternative...`);
+        
+        // Try alternative endpoint
+        const altOptions = {
+          hostname: 'www.capitoltrades.com',
+          path: '/trades',
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        };
+        
+        https.get(altOptions, (altRes) => {
+          let data = '';
+          altRes.on('data', (chunk) => data += chunk);
+          altRes.on('end', () => {
+            const trades = parseCapitolTrades(data);
+            resolve(trades);
+          });
+        }).on('error', reject);
         return;
       }
 
@@ -34,28 +53,74 @@ async function fetchRecentTrades() {
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         try {
-          const parsed = JSON.parse(data);
-          // Get only the most recent 15 trades
-          const recent = Array.isArray(parsed) ? parsed.slice(0, 15) : [];
-          console.log(`Successfully parsed ${recent.length} trades`);
-          resolve(recent);
+          const trades = parseQuiverTrades(data);
+          console.log(`Parsed ${trades.length} trades from page`);
+          resolve(trades);
         } catch (e) {
-          console.error('JSON parse error:', e.message);
-          console.error('Data preview:', data.substring(0, 200));
-          reject(e);
+          console.error('Parse error:', e.message);
+          resolve([]);
         }
       });
-    }).on('error', (err) => {
-      console.error('HTTPS request error:', err.message);
-      reject(err);
-    });
+    }).on('error', reject);
   });
 }
 
-// Check if we've seen this trade before in Supabase
+// Parse trades from Quiver HTML
+function parseQuiverTrades(html) {
+  const trades = [];
+  const rows = html.match(/<tr[^>]*>.*?<\/tr>/gs) || [];
+  
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const row = rows[i];
+    if (!row.includes('Representative') && !row.includes('Senator')) continue;
+    
+    const cells = row.match(/<td[^>]*>(.*?)<\/td>/gs) || [];
+    if (cells.length < 5) continue;
+    
+    const getText = (cell) => cell.replace(/<[^>]*>/g, '').trim();
+    
+    trades.push({
+      politician: getText(cells[0]),
+      ticker: getText(cells[1]),
+      type: getText(cells[2]),
+      amount: getText(cells[3]),
+      date: getText(cells[4])
+    });
+  }
+  
+  return trades;
+}
+
+// Parse trades from Capitol Trades HTML
+function parseCapitolTrades(html) {
+  const trades = [];
+  
+  // Look for politician names and tickers
+  const patterns = html.match(/data-politician="([^"]*)".*?data-ticker="([^"]*)".*?data-type="([^"]*)"/gs) || [];
+  
+  for (let i = 0; i < Math.min(patterns.length, 20); i++) {
+    const match = patterns[i];
+    const politician = (match.match(/data-politician="([^"]*)"/) || [])[1];
+    const ticker = (match.match(/data-ticker="([^"]*)"/) || [])[1];
+    const type = (match.match(/data-type="([^"]*)"/) || [])[1];
+    
+    if (politician && ticker) {
+      trades.push({
+        politician,
+        ticker,
+        type: type || 'Unknown',
+        amount: 'See website',
+        date: new Date().toISOString().split('T')[0]
+      });
+    }
+  }
+  
+  return trades;
+}
+
+// Check if we've seen this trade before
 async function isNewTrade(tradeId) {
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_KEY) {
-    console.log('Supabase not configured, treating all as new');
     return true;
   }
 
@@ -93,7 +158,7 @@ async function isNewTrade(tradeId) {
   });
 }
 
-// Mark trade as seen in Supabase
+// Mark trade as seen
 async function markAsSeen(trade) {
   if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_KEY) {
     return Promise.resolve();
@@ -104,10 +169,10 @@ async function markAsSeen(trade) {
       const url = new URL(`${CONFIG.SUPABASE_URL}/rest/v1/seen_trades`);
       
       const postData = JSON.stringify({
-        id: trade.transaction_date + '-' + trade.senator + '-' + trade.ticker,
-        politician: trade.senator,
+        id: trade.date + '-' + trade.politician + '-' + trade.ticker,
+        politician: trade.politician,
         ticker: trade.ticker,
-        filed_date: trade.transaction_date
+        filed_date: trade.date
       });
 
       const options = {
@@ -130,35 +195,38 @@ async function markAsSeen(trade) {
   });
 }
 
-// Send email alert via Resend
+// Send email alert
 async function sendEmailAlert(trades) {
   if (!CONFIG.RESEND_API_KEY || !CONFIG.YOUR_EMAIL) {
-    console.log('Email not configured, skipping email');
+    console.log('⚠️  Email not configured');
+    console.log('New trades found:', trades.length);
+    trades.slice(0, 5).forEach(t => {
+      console.log(`  - ${t.politician}: ${t.type} ${t.ticker}`);
+    });
     return Promise.resolve();
   }
 
   const tradesList = trades.slice(0, 10).map(t => 
-    `• ${t.senator || t.representative}: ${t.type} ${t.ticker} ($${t.amount || 'Unknown'}) - ${t.transaction_date}`
+    `• ${t.politician}: ${t.type} ${t.ticker} (${t.amount})`
   ).join('\n');
 
   const emailBody = `
-🚨 New Congressional Stock Trades Filed!
+🚨 New Congressional Stock Trades!
 
 ${tradesList}
 
-${trades.length > 10 ? `\n... and ${trades.length - 10} more trades\n` : ''}
-
-View all trades at: https://senatestockwatcher.com/
+${trades.length > 10 ? `... and ${trades.length - 10} more\n` : ''}
+View all: https://www.capitoltrades.com/
 
 ---
-This is an automated alert from your Congressional Trade Tracker.
+Congressional Trade Tracker
   `.trim();
 
   return new Promise((resolve, reject) => {
     const postData = JSON.stringify({
       from: 'alerts@resend.dev',
       to: CONFIG.YOUR_EMAIL,
-      subject: `🚨 ${trades.length} New Congressional Trade${trades.length > 1 ? 's' : ''} Filed`,
+      subject: `🚨 ${trades.length} New Congressional Trade${trades.length > 1 ? 's' : ''}`,
       text: emailBody
     });
 
@@ -178,10 +246,10 @@ This is an automated alert from your Congressional Trade Tracker.
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         if (res.statusCode === 200) {
-          console.log('✓ Email sent successfully');
+          console.log('✓ Email sent!');
           resolve(data);
         } else {
-          console.error(`Email failed: ${res.statusCode} - ${data}`);
+          console.error(`Email failed: ${res.statusCode}`);
           reject(new Error(`Email failed: ${res.statusCode}`));
         }
       });
@@ -193,46 +261,35 @@ This is an automated alert from your Congressional Trade Tracker.
   });
 }
 
-// Main function
+// Main
 async function checkForNewTrades() {
-  console.log('🔍 Starting Congressional Trade Checker...');
-  console.log('Email configured:', !!CONFIG.YOUR_EMAIL);
-  console.log('Resend configured:', !!CONFIG.RESEND_API_KEY);
-  console.log('Supabase configured:', !!CONFIG.SUPABASE_URL);
+  console.log('🔍 Congressional Trade Checker Starting...');
   
   try {
     const trades = await fetchRecentTrades();
     
     if (!trades || trades.length === 0) {
-      console.log('❌ No trades found');
+      console.log('⚠️  Could not fetch trades (site may be blocking)');
+      console.log('💡 Tip: Add YOUR_EMAIL and RESEND_API_KEY secrets for email alerts');
       return;
     }
 
-    console.log(`✓ Found ${trades.length} recent trades`);
+    console.log(`✓ Found ${trades.length} trades`);
     
     const newTrades = [];
     for (const trade of trades) {
-      if (!trade.senator && !trade.representative) continue;
-      if (!trade.ticker) continue;
-      
-      const tradeId = (trade.transaction_date || trade.disclosure_date) + '-' + 
-                     (trade.senator || trade.representative) + '-' + trade.ticker;
-      
+      const tradeId = trade.date + '-' + trade.politician + '-' + trade.ticker;
       if (await isNewTrade(tradeId)) {
         newTrades.push(trade);
       }
     }
     
     if (newTrades.length === 0) {
-      console.log('✓ No new trades (all previously seen)');
+      console.log('✓ No new trades (all seen before)');
       return;
     }
     
-    console.log(`🎯 Found ${newTrades.length} NEW trades!`);
-    
-    // Show sample
-    console.log('Sample:', newTrades[0].senator || newTrades[0].representative, 
-                newTrades[0].type, newTrades[0].ticker);
+    console.log(`🎯 ${newTrades.length} NEW trades!`);
     
     await sendEmailAlert(newTrades);
     
@@ -240,11 +297,10 @@ async function checkForNewTrades() {
       await markAsSeen(trade);
     }
     
-    console.log('✓ All done!');
+    console.log('✅ Done!');
     
   } catch (error) {
     console.error('❌ Error:', error.message);
-    console.error('Stack:', error.stack);
     throw error;
   }
 }
